@@ -416,7 +416,7 @@ GRID_C4    = "#ffffff"
 DRUM_COLOR = "#aaaaaa"
 
 
-def _draw_c4_reference(ax, duration: float, cfg: StaffConfig):
+def _draw_c4_reference(ax, duration: float, cfg: StaffConfig, pt_scale: float = 1.0):
     """
     Single C4 reference line + sparse faint octave lines.
     This is the only persistent pitch grid on pitched staves —
@@ -430,14 +430,14 @@ def _draw_c4_reference(ax, duration: float, cfg: StaffConfig):
         ax.axhline(
             y=hz,
             color="#ffffff" if is_c4 else "#333333",
-            linewidth=1.0 if is_c4 else 0.3,
+            linewidth=(0.5 if is_c4 else 0.2) * pt_scale,
             alpha=0.9 if is_c4 else 0.6,
             zorder=2,
         )
         if is_c4:
             ax.text(
                 duration * 0.001, hz, "C4",
-                color="#ffffff", fontsize=6, va="bottom",
+                color="#ffffff", fontsize=4 * pt_scale, va="bottom",
                 zorder=4, transform=ax.transData,
             )
 
@@ -446,31 +446,68 @@ def _draw_note_overlay(
     ax,
     notes: list[NoteEvent],
     cfg: StaffConfig,
+    pt_scale: float = 1.0,
     note_lw: float = 1.5,
+    px_per_sec: int = 60,
+    staff_height_px: int = 280,
 ):
     """
-    Draw each detected note as a horizontal line segment at its fundamental
-    frequency, spanning onset to offset.  This is a piano-roll overlay on top
-    of the CQT background — only fundamentals are annotated, partials remain
-    visible as CQT energy but are unlabeled.
+    Draw each detected note as a horizontal bar at its fundamental frequency
+    from onset to offset, with a pitch-name label at the onset.
+
+    Collision avoidance — global 2D check across ALL labels:
+      - Estimated text footprint in data units is computed from pt_scale,
+        px_per_sec, and staff_height_px so thresholds are DPI-invariant.
+      - A label is suppressed if any already-placed label is within
+        time_gap seconds (x) AND pitch_gap semitones (y).
+      - Bars are always drawn; only text is selectively skipped.
     """
     if not notes:
         return
 
-    for note in notes:
+    font_pts  = 3.0 * pt_scale            # rendered font size in points
+    bar_lw    = note_lw * pt_scale
+
+    # Estimate label footprint in data coordinates.
+    # 1 pt = 1/72 inch; figure maps REF_DPI px → 1 inch, so 1 pt ≈ REF_DPI/72 px.
+    # px_per_sec converts px → seconds for x; staff_height_px / n_octaves for y.
+    n_octaves  = np.log2(cfg.fmax_hz / cfg.fmin_hz)
+    ref_dpi    = 100
+    pts_per_px = 72 / ref_dpi
+    # ~4 chars wide, height = 1 line
+    time_gap   = (font_pts / pts_per_px) * 4 / px_per_sec   # seconds
+    pitch_gap  = (font_pts / pts_per_px) / (staff_height_px / (n_octaves * 12))  # semitones
+
+    placed: list[tuple[float, int]] = []   # (onset_s, midi_pitch) of drawn labels
+
+    for note in sorted(notes, key=lambda n: (n.onset_s, n.midi_pitch)):
         hz = librosa.midi_to_hz(note.midi_pitch)
         if not (cfg.fmin_hz <= hz <= cfg.fmax_hz):
             continue
-        alpha = 0.4 + 0.6 * note.confidence   # brighter = more confident
+        alpha = 0.4 + 0.6 * note.confidence
         ax.hlines(
             y=hz,
             xmin=note.onset_s,
             xmax=note.offset_s,
             colors=cfg.note_color,
-            linewidths=note_lw,
+            linewidths=bar_lw,
             alpha=alpha,
             zorder=5,
         )
+        # Suppress label if it would overlap any previously placed label
+        collides = any(
+            abs(note.onset_s - px) < time_gap and abs(note.midi_pitch - pp) < pitch_gap
+            for px, pp in placed
+        )
+        if not collides:
+            ax.text(
+                note.onset_s, hz,
+                librosa.midi_to_note(note.midi_pitch),
+                color=cfg.note_color, fontsize=font_pts,
+                va="bottom", alpha=0.95,
+                zorder=6, clip_on=True,
+            )
+            placed.append((note.onset_s, note.midi_pitch))
 
 
 def _draw_drum_annotations(ax, duration: float, cfg: StaffConfig):
@@ -498,11 +535,13 @@ def render_score(
 ):
     hop_length = max(1, int(sr / px_per_sec))
     duration = len(stems["Piano"]) / sr
-    width_px = int(duration * px_per_sec)
+    width_px  = int(duration * px_per_sec)
     total_height_px = staff_height_px * len(staff_configs)
+    _REF_DPI  = 100
+    pt_scale  = _REF_DPI / dpi   # keeps point-sized elements DPI-invariant
 
     print(f"[render]  Image: {width_px} x {total_height_px} px  "
-          f"({duration:.1f}s @ {px_per_sec} px/s)")
+          f"({duration:.1f}s @ {px_per_sec} px/s, dpi={dpi})")
 
     cqts = {}
     for cfg in staff_configs:
@@ -547,9 +586,11 @@ def render_score(
         )
 
         if cfg.annotate_pitch:
-            _draw_c4_reference(ax, duration, cfg)
+            _draw_c4_reference(ax, duration, cfg, pt_scale=pt_scale)
             if note_overlay:
-                _draw_note_overlay(ax, note_events.get(cfg.name, []), cfg)
+                _draw_note_overlay(ax, note_events.get(cfg.name, []), cfg,
+                                   pt_scale=pt_scale, px_per_sec=px_per_sec,
+                                   staff_height_px=staff_height_px)
             ax.set_yticklabels([])
         else:
             _draw_drum_annotations(ax, duration, cfg)
